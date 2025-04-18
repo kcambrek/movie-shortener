@@ -6,7 +6,7 @@ from shorten import (
     VideoEmbeddingModel,
     detect_interesting_segments,
     assemble_final_video_streaming,
-    get_frame_count,
+    VideoHashModel,
 )
 import matplotlib.pyplot as plt
 import time
@@ -46,6 +46,10 @@ if 'graph_file' not in st.session_state:
     # Create a temporary file for the graph
     temp_graph_dir = tempfile.mkdtemp()
     st.session_state.graph_file = os.path.join(temp_graph_dir, "segments_graph.png")
+if 'frame_data' not in st.session_state:
+    st.session_state.frame_data = {}
+if 'selected_segments' not in st.session_state:
+    st.session_state.selected_segments = []
 
 # Sidebar for progress tracking
 st.sidebar.title("Processing Status")
@@ -140,10 +144,17 @@ col1, col2 = st.columns(2)
 with col1:
     if st.session_state.video_path:
         interval = st.slider("Frame sampling interval (seconds)", 0.1, 5.0, 1.0, step=0.1)
-        segment_padding = st.slider("Segment padding (seconds)", 0.5, 3.0, 1.0, step=0.1)
-        
-        embedding_method = st.selectbox("Embedding method", ["ResNet18", "ShuffleNet"])
-        embedding_model = VideoEmbeddingModel(embedding_method)
+        segment_padding = st.slider("Segment duration (seconds)", 0.5, 5.0, 2.0, step=0.1) / 2
+        if interval < segment_padding * 2:
+            st.warning("Frame sampling interval must be greater than segment padding.")
+            st.stop()
+
+        method = st.selectbox("Select representation method", ["hash", "embeddings"])
+        if method == "embeddings":
+            embedding_method = st.selectbox("Embedding method", ["ResNet18", "ShuffleNet"])
+            embedding_model = VideoEmbeddingModel(embedding_method)
+        else:
+            embedding_model = VideoHashModel(hash_method="dhash", hash_size=8) 
         if st.button("Process Video"):
             # Reset state
             st.session_state.processing_complete = False
@@ -161,28 +172,37 @@ with col1:
             
             with st.spinner("Processing video frames..."):
                 try:
-                    # Get total frames for progress tracking
-                    # total_frames = get_frame_count(st.session_state.video_path, interval=interval)
-                    total_frames = 10_000
-                    # Create a Streamlit progress bar
+
                     progress_text = "Processing video frames..."
-                    progress_bar = st.progress(0)
                     
                     # Track processed frames
-                    processed_frames = 0
+                    processed_seconds = 0
+                    
+                    # Create a placeholder for displaying processed frames
+                    seconds_placeholder = st.empty()
                     
                     # Process frames in batches
-                    for timestamps, frames in extract_frames(st.session_state.video_path, interval=interval):
-                        embeddings = embedding_model.compute_embeddings(frames)
-                        st.session_state.embeddings_data.extend(zip(timestamps, embeddings))
-                        st.session_state.preview_frames.update(dict(zip(timestamps, frames)))
+                    for timestamps, frames, hashes, seconds_processed in extract_frames(st.session_state.video_path, interval=interval, batch_size=64):
+                        if method == "hash":
+                            # Convert hash objects to numerical arrays for processing
+                            hash_vectors = [np.array(list(h.hash.flatten())) for h in hashes]
+                            embeddings = np.array(hash_vectors)
+                        else:
+                            # Use regular embedding computation for the embedding model
+                            embeddings = embedding_model.compute_embeddings(frames)
                         
-                        # Update progress
-                        processed_frames += len(frames)
-                        progress_bar.progress(min(1.0, processed_frames / total_frames))
+                        st.session_state.embeddings_data.extend(
+                            zip(timestamps, embeddings)
+                        )
+                        st.session_state.preview_frames.update(
+                            dict(zip(timestamps, frames))
+                        )
+                        
+                        # Update progress using the frame_count from extract_frames
+                        processed_seconds = seconds_processed
+                        # Display updated processed frames count
+                        seconds_placeholder.write(f"Processed seconds: {processed_seconds}")
                     
-                    # Complete the progress bar
-                    progress_bar.progress(1.0)
                     
                     st.session_state.steps['extract_frames']['status'] = 'complete'
                     st.session_state.steps['extract_frames']['complete'] = True
@@ -208,46 +228,43 @@ if st.session_state.processing_complete:
         with st.expander("Advanced Settings"):
             kernel_size = st.slider("Kernel size for smoothing", 3, 15, 5, step=2)
             distance = st.slider("Minimum distance between peaks", 3, 20, 9)
-        
+            inverse = st.checkbox("Inverse", value=False)
         if st.button("Find Interesting Moments"):
             if st.session_state.embeddings_data:
                 timestamps, embeddings = zip(*st.session_state.embeddings_data)
+                diffs = embedding_model.compute_diffs(embeddings)
+                
                 segments = detect_interesting_segments(
-                    np.array(embeddings),
+                    diffs,
                     timestamps,
                     target_duration=target_duration,
                     segment_padding=segment_padding,
                     kernel_size=kernel_size,
                     distance=distance,
-                    graph_output_file=st.session_state.graph_file
+                    graph_output_file=st.session_state.graph_file,
+                    inverse=inverse
                 )
                 
-                # Assuming detect_interesting_segments returns segments with scores
-                # If it doesn't currently return scores, you'll need to modify that function
+                # Store the detected segments directly
+                st.session_state.segments = segments
                 
                 # Create a comprehensive frame data dictionary with all metadata
                 frame_data = {}
-                # segment_scores = {}
                 
-                # Process each segment with its importance score
-                # If your detect_interesting_segments doesn't return scores,
-                # you'll need to modify it to return (start, end, score) tuples
+                # Process each segment
                 for i, (start, end) in enumerate(segments):                    
                     # Store frames with segment metadata
                     relevant_timestamps = [t for t in st.session_state.preview_frames.keys()
-                                        if start <= t <= end]
+                                         if start <= t <= end]
                     for t in relevant_timestamps:
                         frame_data[t] = {
                             'frame': st.session_state.preview_frames[t],
                             'timestamp': t,
                             'formatted_time': time.strftime('%M:%S', time.gmtime(t)),
                             'segment': (start, end),
-                            # 'score': score
                         }
                 
-                st.session_state.frame_data = frame_data
-                # st.session_state.segment_scores = segment_scores
-                st.session_state.segments = segments
+                st.session_state.frame_data.update(frame_data)
                 st.session_state.steps['find_peaks']['status'] = 'complete'
                 st.session_state.steps['find_peaks']['complete'] = True
                 st.session_state.peaks_detected = True
@@ -264,29 +281,15 @@ if st.session_state.processing_complete:
 if st.session_state.peaks_detected:
     st.header("Select Video Clips")
     
-    # Initialize selected_segments in session state if not exists
-    if 'selected_segments' not in st.session_state:
-        st.session_state.selected_segments = None
-    
-    if st.session_state.segments is not None:
-        # Add filtering and sorting options
-        col1, col2 = st.columns(2)
+    if st.session_state.segments:
+        # Create a temporary list to collect current selections
+        current_selections = []
         
-        # Filter segments by score and sort them
-        filtered_segments = [(start, end) for (start, end) in st.session_state.segments]
-        
-
-        sorted_segments = sorted(filtered_segments, key=lambda x: x[0])
-        
-        # Create checkboxes for each segment
-        selected_segments = []
-        
-        for c, (start_time, end_time) in enumerate(sorted_segments):
+        for c, (start_time, end_time) in enumerate(st.session_state.segments):
             # Format times to be more readable
             start_formatted = time.strftime('%M:%S', time.gmtime(start_time))
             end_formatted = time.strftime('%M:%S', time.gmtime(end_time))
             duration = end_time - start_time
-            # score = st.session_state.segment_scores.get((start_time, end_time), 0)
             
             # Create a unique key for each checkbox
             checkbox_key = f"segment_{c}_{start_time}_{end_time}"
@@ -296,23 +299,23 @@ if st.session_state.peaks_detected:
                 col1, col2, col3 = st.columns([1, 3, 5])
                 
                 with col1:
-                    if st.checkbox("Include", value=True, key=checkbox_key):
-                        selected_segments.append((start_time, end_time))
-                    st.write(f"Clip {c+1}")
+                    # Use the checkbox to directly update session state
+                    if st.checkbox("Include", key=checkbox_key):
+                        current_selections.append({'start_time': start_time, 'end_time': end_time})
+                    st.write(f"Clip {c + 1}")
                 
                 with col2:
                     st.write(f"{start_formatted} - {end_formatted}")
                     st.write(f"Duration: {duration:.1f}s")
-                    # st.write(f"Score: {score:.2f}")
                 
                 with col3:
                     # Get frames within this segment
                     segment_timestamps = [t for t in st.session_state.frame_data.keys()
-                                         if start_time <= t <= end_time]
+                                        if start_time <= t <= end_time]
                     
                     if segment_timestamps:
                         # Show the middle frame as a preview
-                        middle_timestamp = segment_timestamps[len(segment_timestamps)//2]
+                        middle_timestamp = segment_timestamps[len(segment_timestamps) // 2]
                         frame_info = st.session_state.frame_data[middle_timestamp]
                         st.image(
                             frame_info['frame'], 
@@ -323,9 +326,13 @@ if st.session_state.peaks_detected:
                 # Add a separator between clips
                 st.markdown("---")
         
-        st.session_state.selected_segments = selected_segments
+        # Update session state with current selections
+        st.session_state.selected_segments += current_selections
+        # remove duplicates
+        st.session_state.selected_segments = [dict(t) for t in {tuple(sorted(d.items())) for d in st.session_state.selected_segments}]
+
         
-        total_duration = sum(end - start for start, end in selected_segments)
+        total_duration = len(st.session_state.selected_segments) * segment_padding
         st.info(f"Total selected duration: {total_duration:.1f} seconds")
 
 # Generate shortened video section
@@ -335,7 +342,7 @@ if st.session_state.peaks_detected and st.session_state.selected_segments:
     vertical = st.checkbox("Video is vertical", value=False)
     
     if st.button("Generate Shortened Video"):
-        if st.session_state.selected_segments:  # Changed from segments to selected_segments
+        if st.session_state.selected_segments:  # Check if the list is not empty
             # Update generate video status
             st.session_state.steps['generate_video']['status'] = 'in_progress'
             st.session_state.progress['generate_video'] = 0

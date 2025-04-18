@@ -7,3 +7,5 @@ moviepy==1.0.3
 Pillow
 scipy
 matplotlib
+imagehash
+streamlit
